@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Натальная карта</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body {
+      background: black;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+
+    h1 {
+      color: white;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+
+    form {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 15px;
+    }
+
+    label {
+      color: white;
+      font-size: 16px;
+      text-align: center;
+    }
+
+    input {
+      padding: 10px;
+      font-size: 16px;
+      border: none;
+      border-radius: 5px;
+      outline: none;
+      width: 200px;
+    }
+
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      color: white;
+      background-color: #0078d7;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: background-color 0.3s;
+    }
+
+    button:hover {
+      background-color: #005bb5;
+    }
+
+    .result {
+      margin-top: 20px;
+      color: white;
+      font-size: 16px;
+      text-align: center;
+      padding: 20px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.5s ease-in-out, transform 0.5s ease-in-out;
+    }
+
+    .result.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <h1>Натальная карта</h1>
+  <form id="natalForm">
+    <label for="birthDate">Дата рождения:</label>
+    <input type="date" id="birthDate" name="birthDate" required />
+    
+    <label for="birthTime">Время рождения:</label>
+    <input type="time" id="birthTime" name="birthTime" required />
+    
+    <label for="birthCity">Город рождения:</label>
+    <input type="text" id="birthCity" name="birthCity" placeholder="Введите город" required />
+    
+    <button type="submit">Построить карту</button>
+  </form>
+
+  <div class="result" id="result"></div>
+
+  <script>
+    const form = document.getElementById('natalForm');
+    const resultDiv = document.getElementById('result');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const birthDate = document.getElementById('birthDate').value;
+      const birthTime = document.getElementById('birthTime').value;
+      const birthCity = document.getElementById('birthCity').value;
+
+      const query = `Make a detailed natal chart analysis for a person born on ${birthDate} at ${birthTime} in ${birthCity}. Provide a structured response with the following sections:
+
+**🌞 Sun Sign & Personality:** Describe the person's core traits and life purpose based on their Sun sign.  
+**🌙 Moon Sign & Emotions:** Explain their emotional nature, inner world, and instincts.  
+**⬆ Ascendant (Rising Sign):** Define their outward personality, first impressions, and how they approach life.  
+**🪐 Major Planets:** Provide interpretations for Mercury (mind & communication), Venus (love & relationships), Mars (action & energy), Jupiter (growth & luck), and Saturn (discipline & challenges).  
+**🏡 House Analysis:** Highlight the most important houses that shape career, relationships, and personal development.  
+**🔗 Key Aspects:** Explain significant planetary aspects (conjunctions, trines, squares) and their influence.  
+**✨ Life Themes & Guidance:** Summarize the key themes of their life path and offer advice based on their chart.  
+
+Limit the response to 2000 characters while keeping it insightful, engaging, and easy to read.`;
+
+      try {
+        const response = await fetch('https://9d18-79-127-211-218.ngrok-free.app/natal/gemini', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query })
+        });
+
+        const data = await response.json();
+        const answer = data.answer || 'Ошибка получения ответа от Gemini.';
+        
+        // Добавляем эффект появления текста
+        resultDiv.textContent = answer;
+        resultDiv.classList.add('show');
+
+        // Отправка ответа обратно в Telegram Web App
+        if (window.Telegram.WebApp) {
+          window.Telegram.WebApp.sendData(JSON.stringify({ natal_chart: answer }));
+        }
+      } catch (error) {
+        resultDiv.textContent = 'Ошибка подключения: ' + error.message;
+        resultDiv.classList.add('show');
+      }
+    });
+  </script>
+</body>
+</html>
