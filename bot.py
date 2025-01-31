@@ -2,16 +2,18 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 import sqlite3
 import json  # ВАЖНО: для json.loads
-from google import genai
+import google.generativeai as genai  
 
 # 🔹 Настройки
 API_TOKEN = '7584759675:AAGMKdKTRMjaC0Rc1g-Ysw-5J2dlniIQdAA'
-MINI_APP_URL = 'https://a67f-79-127-211-218.ngrok-free.app'  # Ссылка на мини-приложение
+MINI_APP_URL = 'https://eb12-79-127-211-218.ngrok-free.app'  # Ссылка на мини-приложение
 GEMINI_API_KEY = "AIzaSyCqE4taBEs1GJUh_pJQUqdGgcSEfGL8Pbc"  # Укажите ваш API-ключ Gemini
+
 
 # 🔹 Инициализация бота и Gemini API
 bot = telebot.TeleBot(API_TOKEN)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-pro")
 
 # 🔹 База данных SQLite
 DB_NAME = "users.db"
@@ -37,7 +39,6 @@ def add_user(user_id, username, first_name, last_name):
     """Добавление пользователя в базу данных"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-
     try:
         cursor.execute("""
             INSERT INTO users (user_id, username, first_name, last_name)
@@ -45,9 +46,7 @@ def add_user(user_id, username, first_name, last_name):
         """, (user_id, username, first_name, last_name))
         conn.commit()
     except sqlite3.IntegrityError:
-        # Если пользователь уже есть
-        pass
-    
+        pass  
     conn.close()
 
 # 🔹 Инициализируем базу данных
@@ -65,9 +64,6 @@ tarot_meanings = {
     8: "Дом"
 }
 
-# Словарь для хранения выбранных карт пользователей
-user_cards = {}
-
 # 🔹 Команда /start
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -76,10 +72,8 @@ def start_command(message):
     first_name = message.from_user.first_name
     last_name = message.from_user.last_name
 
-    # Добавляем пользователя в БД
     add_user(user_id, username, first_name, last_name)
 
-    # Кнопка для мини-приложения
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("🔮 Выбрать карты Таро", web_app=WebAppInfo(url=MINI_APP_URL)))
 
@@ -89,27 +83,19 @@ def start_command(message):
         reply_markup=keyboard
     )
 
+# 🔹 Обработка нажатия кнопки "Перейти к раскладу"
 @bot.message_handler(content_types=['web_app_data'])
 def handle_web_app_data(message):
-    print(">>> web_app_data handler TRIGGERED!")
     user_id = message.chat.id
 
     try:
-        # Данные, пришедшие из tg.sendData(...) (JSON-строка)
+        # Декодируем JSON-данные от WebApp
         selected_cards_json = message.web_app_data.data
-        selected_cards = json.loads(selected_cards_json)  # Превращаем JSON в список
+        selected_cards = json.loads(selected_cards_json)  
 
-        # Например selected_cards = ["Таро1.jpg", "Таро5.jpg", "Таро3.jpg"]
-
-        # Преобразуем имена файлов в номера карт (1..8)
-        # Ищем совпадение по шаблону: "Таро{номер}.jpg"
         numbers = []
         for filename in selected_cards:
-            # Из "Таро1.jpg" достаём 1
-            # Можно регуляркой, но можно проще:
-            # вырезать "Таро" и ".jpg": "1"
             num_str = filename.replace("Таро", "").replace(".jpg", "")
-            # Пробуем привести к int
             try:
                 num = int(num_str)
                 numbers.append(num)
@@ -120,58 +106,31 @@ def handle_web_app_data(message):
             bot.send_message(user_id, "❌ Не удалось определить выбранные карты.")
             return
 
-        # Получаем значения карт по номерам
-        selected_meanings = []
-        for num in numbers:
-            meaning = tarot_meanings.get(num)
-            if meaning:
-                selected_meanings.append(meaning)
-
+        selected_meanings = [tarot_meanings.get(num) for num in numbers if tarot_meanings.get(num)]
         if len(selected_meanings) != 3:
             bot.send_message(user_id, "❌ Ошибка в определении карт.")
             return
 
-        # Формируем запрос в Gemini
-        query = (
-            f"Карты таро показали человеку {', '.join(selected_meanings)}. "
-            f"Какое значение это может иметь? Дай ответ до 800 символов."
-        )
-        print("🔍 Запрос в Gemini:", query)
+        # 🔹 Отправляем запрос в Gemini по каждой карте и отправляем три отдельных сообщения
+        for meaning in selected_meanings:
+            query = f"Человеку выпала карта {meaning}. Дай предсказание, какое значение это может иметь? Ответ до 500 символов."
+            try:
+                response = model.generate_content(query)
+                if hasattr(response, "text") and response.text:
+                    prediction = response.text.strip()
+                else:
+                    prediction = "❌ Gemini не дал ответа."
+            except Exception as e:
+                print("❌ Ошибка при запросе к Gemini:", e)
+                prediction = "🚨 Ошибка при запросе к Gemini."
 
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash-exp",
-                contents=query
-            )
-
-            if hasattr(response, "text") and response.text:
-                answer = response.text.strip()
-            else:
-                answer = "❌ Gemini не дал понятного ответа."
-
-            print("🔮 Ответ от Gemini:", answer)
-
-            # Отправляем ответ пользователю
-            bot.send_message(
-                chat_id=user_id,
-                text=f"📜 Твои карты: {', '.join(selected_meanings)}\n\n✨ Ответ от Gemini:\n{answer}"
-            )
-
-        except Exception as e:
-            print("❌ Ошибка при запросе к Gemini:", e)
-            bot.send_message(
-                chat_id=user_id,
-                text="🚨 Ошибка при запросе к Gemini. Попробуйте позже."
-            )
+            bot.send_message(user_id, f"🔮 Карта: {meaning}\n✨ {prediction}")
 
     except Exception as e:
         print("❌ Ошибка обработки web_app_data:", e)
         bot.send_message(user_id, "❌ Невозможно обработать данные от мини-приложения.")
 
-
-
 # 🔹 Запуск бота
 if __name__ == '__main__':
     print("🚀 Бот запущен...")
     bot.polling(none_stop=True)
-
