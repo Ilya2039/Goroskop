@@ -24,10 +24,6 @@ def tarot_page():
 def natal_page():
     return render_template('natal/index.html')
 
-# Новый маршрут для Гороскопа
-@app.route('/horoscope/')
-def horoscope_page():
-    return render_template('horoscope/index.html')
 
 # Маршрут для обработки запросов к Gemini
 @app.route('/natal/gemini', methods=['POST'])
@@ -67,6 +63,46 @@ def natal_gemini():
     except Exception as e:
         logging.exception("Ошибка при обработке запроса")
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+    
+# ✅ **Гороскоп на сегодня**
+@app.route('/horoscope/today', methods=['POST'])
+def horoscope_today():
+    try:
+        logging.info("Получен запрос на гороскоп на сегодня")
+
+        data = request.get_json()
+        zodiac_sign = data.get('zodiac_sign')
+
+        if not zodiac_sign:
+            logging.error("Некорректный запрос: отсутствует знак зодиака")
+            return jsonify({'error': 'Укажите знак зодиака'}), 400
+
+        # Запрос в Gemini
+        query = f"Предоставь детальный гороскоп на сегодня для знака зодиака {zodiac_sign}. Ответ должен быть кратким и содержательным."
+
+        logging.info(f"Отправляем запрос в Gemini: {query}")
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=query
+        )
+
+        # Проверяем ответ
+        if hasattr(response, 'text') and response.text:
+            result = response.text.strip()
+            logging.info(f"Ответ от Gemini: {result}")
+
+            # Переводим ответ на русский
+            translated_result = translator.translate(result, src='en', dest='ru').text
+            logging.info(f"Переведенный ответ: {translated_result}")
+
+            return jsonify({'answer': translated_result})
+        else:
+            logging.error("Gemini вернул пустой ответ")
+            return jsonify({'error': 'Gemini не дал ответа'}), 500
+
+    except Exception as e:
+        logging.exception("Ошибка при обработке запроса")
+        return jsonify({'error': f'Ошибка сервера: {str(e)}'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8000)
