@@ -1,36 +1,50 @@
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-import sqlite3
-import json  # Для обработки данных из Web App
-from google import genai
-import requests
+import asyncio
 import logging
-# from googletrans import Translator
-from datetime import datetime
-# from google.cloud import translate_v2 as translate
-from translatepy import Translator
+import sqlite3
 import time
+from datetime import datetime
 
-# 🔹 Настройки
+from translatepy import Translator
+from google import genai
+
+from aiogram import Bot, Dispatcher, types, Router, F
+from aiogram.filters import Command
+from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton, 
+                           WebAppInfo, CallbackQuery, Message)
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+# Если нужно использовать Google Gemini:
+# from google import genai
+# gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ================== Константы / настройки ==================
+
 API_TOKEN = '7582972873:AAGX0VJea8BdfGpV_QLvU3sBtXZi9L-xNrw'
 TAROT_APP_URL = 'https://e04c-169-150-209-163.ngrok-free.app/tarot/'
 NATAL_APP_URL = 'https://e04c-169-150-209-163.ngrok-free.app/natal/'
 flask_url = "https://e04c-169-150-209-163.ngrok-free.app/horoscope/today"
 GEMINI_API_KEY = "AIzaSyCqE4taBEs1GJUh_pJQUqdGgcSEfGL8Pbc"
 
-# 🔹 Инициализация бота и Gemini API
-bot = telebot.TeleBot(API_TOKEN)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-translator = Translator()
 
-# 🔹 Логирование
-logging.basicConfig(level=logging.DEBUG)
-
-# 🔹 База данных SQLite
 DB_NAME = "users.db"
 
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+# Инициализация диспетчера и роутера
+dp = Dispatcher()
+router = Router()
+
+translator = Translator()
+
+# ================== База данных ==================
+
 def init_db():
-    """Инициализация базы данных"""
+    """Инициализация базы данных SQLite (синхронно, вызывается один раз при старте)."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
@@ -47,7 +61,7 @@ def init_db():
     conn.close()
 
 def add_user(user_id, username, first_name, last_name):
-    """Добавление пользователя в базу данных"""
+    """Добавление пользователя в БД (синхронно)."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
@@ -62,12 +76,13 @@ def add_user(user_id, username, first_name, last_name):
     
     conn.close()
 
-# 🔹 Инициализируем базу данных
+# Инициализируем БД при старте
 init_db()
 
-# 🔹 Команда /start
-@bot.message_handler(commands=['start'])
-def start_command(message):
+# ================== Хендлер /start ==================
+
+@router.message(Command("start"))
+async def start_command(message: Message):
     """Главное меню"""
     user_id = message.from_user.id
     username = message.from_user.username
@@ -77,35 +92,39 @@ def start_command(message):
     # Добавляем пользователя в БД
     add_user(user_id, username, first_name, last_name)
 
-    # Клавиатура с кнопками
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔮 Сделать расклад Таро", web_app=WebAppInfo(url=TAROT_APP_URL)))
-    keyboard.add(InlineKeyboardButton("🌌 Получить натальную карту", web_app=WebAppInfo(url=NATAL_APP_URL)))
-    keyboard.add(InlineKeyboardButton("✨ Гороскоп", callback_data="horoscope"))
-    keyboard.add(InlineKeyboardButton("✨ Консультация Таролога", callback_data="consultation"))
-
-    # Отправляем сообщение с кнопками
-    bot.send_message(
-        chat_id=message.chat.id,
-        text="Привет! Выберите, что вы хотите сделать:",
-        reply_markup=keyboard
+    # Создаем inline-клавиатуру списком списков кнопок
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔮 Сделать расклад Таро",
+                    web_app=WebAppInfo(url=TAROT_APP_URL)
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🌌 Получить натальную карту",
+                    web_app=WebAppInfo(url=NATAL_APP_URL)
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✨ Гороскоп",
+                    callback_data="horoscope"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✨ Консультация Таролога",
+                    callback_data="consultation"
+                )
+            ]
+        ]
     )
 
-'''# 🔹 Обработчик нажатия на кнопку "Гороскоп"
-@bot.callback_query_handler(func=lambda call: call.data == "horoscope")
-def horoscope_menu(call):
-    """Меню выбора типа гороскопа"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🌞 Дневной гороскоп", callback_data="daily_horoscope"))
-    keyboard.add(InlineKeyboardButton("❤️ Любовный гороскоп", callback_data="love_horoscope"))
-    keyboard.add(InlineKeyboardButton("💼 Карьерный гороскоп", callback_data="career_horoscope"))
+    await message.answer("Привет! Выберите, что вы хотите сделать:", reply_markup=keyboard)
 
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="Какой гороскоп хотите?",
-        reply_markup=keyboard
-    )'''
+# ================== Гороскоп ==================
 
 zodiac_translation = {
     "Овен": "Aries", "Телец": "Taurus", "Близнецы": "Gemini", "Рак": "Cancer",
@@ -113,35 +132,54 @@ zodiac_translation = {
     "Стрелец": "Sagittarius", "Козерог": "Capricorn", "Водолей": "Aquarius", "Рыбы": "Pisces"
 }
 
-# 🔹 Меню выбора типа гороскопа
-@bot.callback_query_handler(func=lambda call: call.data == "horoscope")
-def horoscope_menu(call):
+@router.callback_query(F.data == "horoscope")
+async def horoscope_menu(call: CallbackQuery):
     """Меню выбора типа гороскопа"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🌞 Дневной гороскоп", callback_data="daily_horoscope"))
-    keyboard.add(InlineKeyboardButton("❤️ Любовный гороскоп", callback_data="love_horoscope"))
-    keyboard.add(InlineKeyboardButton("💼 Карьерный гороскоп", callback_data="career_horoscope"))
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🌞 Дневной гороскоп",
+                    callback_data="daily_horoscope"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❤️ Любовный гороскоп",
+                    callback_data="love_horoscope"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💼 Карьерный гороскоп",
+                    callback_data="career_horoscope"
+                )
+            ]
+        ]
+    )
 
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
+    await call.message.edit_text(
         text="Какой гороскоп хотите?",
         reply_markup=keyboard
     )
 
-# 🔹 Обработчик выбора типа гороскопа
-@bot.callback_query_handler(func=lambda call: call.data in ["daily_horoscope", "love_horoscope", "career_horoscope"])
-def select_zodiac(call):
+@router.callback_query(lambda c: c.data in ["daily_horoscope", "love_horoscope", "career_horoscope"])
+async def select_zodiac(call: CallbackQuery):
     """Меню выбора знака зодиака"""
-    horoscope_type_full = call.data  
-
+    horoscope_type_full = call.data  # daily_horoscope / love_horoscope / career_horoscope
+    
     zodiac_signs = list(zodiac_translation.keys())
-
-    keyboard = InlineKeyboardMarkup()
+    # Формируем кнопки для каждого знака
+    rows = []
     for sign in zodiac_signs:
-        keyboard.add(InlineKeyboardButton(sign, callback_data=f"{horoscope_type_full}_{sign}"))
+        button = InlineKeyboardButton(
+            text=sign,
+            callback_data=f"{horoscope_type_full}_{sign}"
+        )
+        rows.append([button])  # Каждая кнопка в отдельной строке
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # Отображаем выбранный тип гороскопа
     horoscope_texts_ru = {
         "daily_horoscope": "дневной гороскоп",
         "love_horoscope": "любовный гороскоп",
@@ -149,19 +187,17 @@ def select_zodiac(call):
     }
     display_text = horoscope_texts_ru.get(horoscope_type_full, "гороскоп")
 
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
+    await call.message.edit_text(
         text=f"Вы выбрали {display_text}. Теперь выберите ваш знак зодиака:",
         reply_markup=keyboard
     )
 
-# 🔹 Обработчик выбора знака зодиака и запроса в Gemini
-@bot.callback_query_handler(func=lambda call: any(call.data.startswith(t) for t in ['daily_', 'love_', 'career_']))
-def handle_zodiac_choice(call):
+@router.callback_query(lambda c: c.data.startswith("daily_") or c.data.startswith("love_") or c.data.startswith("career_"))
+async def handle_zodiac_choice(call: CallbackQuery):
+    """Обработка выбора знака зодиака и запроса к (условному) Gemini API"""
     user_id = call.message.chat.id
-    type_full, zodiac_sign = call.data.rsplit('_', 1)
-    horoscope_type = type_full.split('_')[0]  
+    type_full, zodiac_sign = call.data.rsplit('_', 1)   # например, "daily_horoscope", "Овен"
+    horoscope_type = type_full.split('_')[0]           # daily / love / career
 
     # Словарь для отображения типа гороскопа на русском
     horoscope_texts_ru = {
@@ -170,13 +206,13 @@ def handle_zodiac_choice(call):
         'career': 'карьерный гороскоп'
     }
 
-    # Проверяем, что выбранный тип гороскопа корректный
+    # ❌ Убираем клавиатуру (скрываем кнопки)
+    await call.message.edit_reply_markup(reply_markup=None)
+
     if horoscope_type not in horoscope_texts_ru:
-        bot.send_message(user_id, "❌ Ошибка: неверный тип гороскопа.")
+        await bot.send_message(user_id, "❌ Ошибка: неверный тип гороскопа.")
         return
 
-    # Формируем запрос к Gemini на русском языке
-    from datetime import datetime
     today_date = datetime.now().strftime("%Y-%m-%d")
 
     # Уникальные промпты для каждого типа гороскопа
@@ -191,7 +227,6 @@ def handle_zodiac_choice(call):
 
 Сделай ответ четким, логичным и не длиннее 1000 символов.
 """,
-
         'love': f"""
 Дай мне подробный любовный гороскоп для знака {zodiac_sign} на {today_date}. Сосредоточься на чувствах, романтических отношениях, личной жизни и возможностях для новых знакомств. Ответ оформи следующим образом:
 
@@ -202,7 +237,6 @@ def handle_zodiac_choice(call):
 
 Сделай ответ четким, логичным и не длиннее 1000 символов.
 """,
-
         'career': f"""
 Дай мне подробный карьерный гороскоп для знака {zodiac_sign} на {today_date}. Сосредоточься на вопросах работы, бизнеса, финансов и профессионального роста. Ответ оформи следующим образом:
 
@@ -215,10 +249,8 @@ def handle_zodiac_choice(call):
 """
     }
 
-    # Выбираем нужный промпт в зависимости от типа гороскопа
     query_ru = horoscope_prompts[horoscope_type]
-
-    logging.info(f"📨 Отправка запроса в Gemini: {query_ru}")
+    logging.info(f"📨 Отправка запроса (гороскоп) к Gemini: {query_ru}")
 
     try:
         # ✅ Отправляем запрос в Gemini напрямую
@@ -236,50 +268,50 @@ def handle_zodiac_choice(call):
             horoscope_russian = "Я не смог сгенерировать гороскоп сейчас. Попробуйте позже."
 
         # ✅ Отправляем ответ в Telegram
-        bot.send_message(user_id, f"🔮 {horoscope_russian}")
+        await bot.send_message(user_id, f"🔮 {horoscope_russian}")
 
     except Exception as e:
         logging.exception(f"🚨 Ошибка при запросе гороскопа: {str(e)}")
-        bot.send_message(user_id, "🚨 Ошибка при запросе гороскопа. Попробуйте позже.")
+        await bot.send_message(user_id, "🚨 Ошибка при запросе гороскопа. Попробуйте позже.")
 
-user_queries = {}           # Для первоначального запроса консультации
-conversation_context = {}
+# ================== Консультация Таролога ==================
 
-# ========= Обработчик запроса консультации =========
-@bot.callback_query_handler(func=lambda call: call.data == "consultation")
-def consultation_menu(call):
+user_queries = {}         # { user_id: str|None } для первоначального запроса консультации
+conversation_context = {} # { user_id: [ {role: "user"/"assistant", content: str}, ... ] }
+
+@router.callback_query(F.data == "consultation")
+async def consultation_menu(call: CallbackQuery):
     """Запрос консультации"""
     user_id = call.message.chat.id
 
-    # Отправляем сообщение с индикатором загрузки
-    bot.send_chat_action(user_id, action='typing')  # Показываем "печатает..."
-    bot.send_message(user_id, "⌛ Ищу специалиста...")
+    # Показываем "печатает..." и отправляем сообщение
+    await bot.send_chat_action(user_id, action='typing')
+    await call.message.answer("⌛ Ищу специалиста...")
 
-    time.sleep(10)  # Эмулируем поиск специалиста
+    # Теперь асинхронно "ждем" 10 секунд (пример), не блокируя других
+    await asyncio.sleep(10)
 
-    # Отправляем финальное сообщение после ожидания
-    bot.send_message(user_id, "✅ Специалист найден! Напишите свой вопрос.")
+    await call.message.answer("✅ Специалист найден! Напишите свой вопрос очень подробно, чтобы Таролог мог дать точный ответ.")
+    user_queries[user_id] = None  # Фиксируем, что ждем первый вопрос
 
-    user_queries[user_id] = None  # Фиксируем ожидание запроса
-
-# ========= Обработчик ввода первого запроса пользователя =========
-@bot.message_handler(func=lambda message: message.chat.id in user_queries and user_queries[message.chat.id] is None)
-def receive_user_query(message):
+@router.message(lambda m: m.chat.id in user_queries and user_queries[m.chat.id] is None)
+async def receive_user_query(message: Message):
+    """Обработчик первого запроса пользователя для консультации"""
     user_id = message.chat.id
     query_text = message.text.strip() if message.text else ""
     
     if not query_text:
-        bot.send_message(user_id, "❌ Ваш вопрос пуст. Пожалуйста, введите корректный запрос.")
+        await message.answer("❌ Ваш вопрос пуст. Пожалуйста, введите корректный запрос.")
         return
 
-    # Сохраняем запрос пользователя
     user_queries[user_id] = query_text
+    await message.answer("⌛ Ждем ответ специалиста...")
+    await bot.send_chat_action(user_id, action='typing')
 
-    bot.send_message(user_id, "⌛ Ждем ответ специалиста...")
-    bot.send_chat_action(user_id, action='typing')
+    # Эмуляция «ожидания» ответа 5 секунд
+    await asyncio.sleep(20)
 
-    time.sleep(20)  # Симуляция ожидания ответа
-
+    # Пример системного prompt
     system_prompt = (
     "Ты — профессиональный таролог с многолетним опытом гадания на картах Таро. "
     "Ты толкуешь карты, используя традиционные расклады и глубокие знания эзотерики. "
@@ -299,68 +331,98 @@ def receive_user_query(message):
     "Пиши в одном потоке, используй мистические метафоры и эзотерические образы.\n\n"
     "Диалог:\n"
 )
-
+    
+    full_prompt = (
+        system_prompt
+        + f"Пользователь: {query_text}\n"
+        + "Таролог:"
+    )
 
     try:
+        # Пример вызова к Gemini:
         response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=system_prompt
+             model="gemini-2.0-flash-exp",
+             contents=full_prompt
         )
-
         if hasattr(response, 'text') and response.text:
             answer = response.text.strip()
         else:
             answer = "Я не смог получить ответ от специалиста. Попробуйте позже."
 
-        bot.send_message(user_id, f"🔮 Ответ специалиста:\n\n{answer}")
+        # Пока заглушка
+        # answer = "🔮 [Пример ответа специалиста] Карты говорят, что ..."
 
-        # **Сохраняем первоначальный вопрос в контексте диалога**
-        conversation_context[user_id] = [{"role": "user", "content": query_text}]
+        await message.answer(f"🔮 Ответ специалиста:\n\n{answer}")
 
-        markup = telebot.types.InlineKeyboardMarkup()
-        start_dialog_button = telebot.types.InlineKeyboardButton(text="Начать диалог", callback_data="start_dialog")
-        markup.add(start_dialog_button)
-        bot.send_message(user_id, "Если хотите продолжить диалог с специалистом, нажмите кнопку ниже.", reply_markup=markup)
+        # Сохраняем историю диалога
+        conversation_context[user_id] = [
+            {"role": "user", "content": query_text},
+            {"role": "assistant", "content": answer}
+        ]
+
+        # Клавиатура для начала полноценного диалога
+        dialog_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Начать диалог",
+                        callback_data="start_dialog"
+                    )
+                ]
+            ]
+        )
+        await message.answer(
+            "Если хотите продолжить диалог со специалистом, нажмите кнопку ниже.",
+            reply_markup=dialog_keyboard
+        )
 
     except Exception as e:
         logging.exception(f"🚨 Ошибка при запросе к Gemini: {str(e)}")
-        bot.send_message(user_id, "🚨 Ошибка при обработке запроса. Попробуйте позже.")
+        await message.answer("🚨 Ошибка при обработке запроса. Попробуйте позже.")
 
+    # Удаляем из user_queries, чтобы не мешало следующему первому вопросу
     del user_queries[user_id]
 
-# ========= Обработчик нажатия кнопки "Начать диалог" =========
-@bot.callback_query_handler(func=lambda call: call.data == "start_dialog")
-def start_dialog_handler(call):
+@router.callback_query(F.data == "start_dialog")
+async def start_dialog_handler(call: CallbackQuery):
     user_id = call.message.chat.id
-    # Инициализируем контекст диалога для пользователя (сохраняем историю сообщений)
     if user_id not in conversation_context:
-        conversation_context[user_id] = []  # начинаем с пустого контекста
-    logging.info(f"Диалог для пользователя {user_id} запущен. Инициализирован пустой контекст.")
-    
-    # Предлагаем ввести первое сообщение в диалоге и показываем кнопку для завершения диалога
-    markup = telebot.types.InlineKeyboardMarkup()
-    end_dialog_button = telebot.types.InlineKeyboardButton(text="Завершить диалог", callback_data="end_dialog")
-    markup.add(end_dialog_button)
-    bot.send_message(user_id,
-                     "Диалог начат. Пожалуйста, введите ваше сообщение. "
-                     "Чтобы завершить диалог, нажмите кнопку ниже.",
-                     reply_markup=markup)
+        conversation_context[user_id] = []
+        logging.info(f"Диалог для пользователя {user_id} инициализирован (пуст).")
 
-# ========= Обработчик сообщений в режиме диалога =========
-@bot.message_handler(func=lambda message: message.chat.id in conversation_context and message.content_type == 'text')
-def dialogue_message_handler(message):
+    end_dialog_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Завершить диалог",
+                    callback_data="end_dialog"
+                )
+            ]
+        ]
+    )
+
+    await call.message.answer(
+        "Диалог начат. Пожалуйста, введите ваше сообщение. "
+        "Чтобы завершить диалог, нажмите кнопку ниже.",
+        reply_markup=end_dialog_keyboard
+    )
+
+@router.message(lambda m: m.chat.id in conversation_context)
+async def dialogue_message_handler(message: Message):
+    """Обработка сообщений, пока пользователь находится в диалоге."""
     user_id = message.chat.id
     user_msg = message.text.strip()
-    
-    logging.info(f"Получено сообщение в диалоге от пользователя {user_id}: {user_msg}")
-    
+
     if not user_msg:
-        bot.send_message(user_id, "❌ Сообщение пусто. Пожалуйста, введите корректный текст.")
+        await message.answer("❌ Сообщение пусто. Пожалуйста, введите корректный текст.")
         return
 
-    # Добавляем сообщение пользователя в контекст
+    logging.info(f"Сообщение в диалоге от {user_id}: {user_msg}")
+
+    # Добавляем в историю
     conversation_context[user_id].append({"role": "user", "content": user_msg})
 
+    # Базовый промпт для диалога
     base_prompt = (
     "Ты — профессиональный таролог с многолетним опытом гадания на картах Таро. "
     "Ты толкуешь карты, используя традиционные расклады и глубокие знания эзотерики. "
@@ -381,8 +443,7 @@ def dialogue_message_handler(message):
     "Диалог:\n"
 )
 
-
-    # Собираем историю сообщений
+    # Собираем историю
     dialogue_history = ""
     for msg in conversation_context[user_id]:
         if msg["role"] == "user":
@@ -390,9 +451,9 @@ def dialogue_message_handler(message):
         else:
             dialogue_history += f"Специалист: {msg['content']}\n"
 
-    full_prompt = base_prompt + dialogue_history
+    full_prompt = base_prompt + "\n\nИстория:\n" + dialogue_history
 
-    bot.send_chat_action(user_id, action='typing')
+    await bot.send_chat_action(user_id, action='typing')
 
     try:
         response = gemini_client.models.generate_content(
@@ -404,35 +465,54 @@ def dialogue_message_handler(message):
             answer = response.text.strip()
         else:
             answer = "Я не смог получить ответ от специалиста. Попробуйте позже."
+        await asyncio.sleep(1)
+        # answer = "🔮 [Пример ответа в диалоге] Я вижу, что карты указывают ..."
 
-        # Добавляем ответ специалиста в контекст диалога
+        # Сохраняем ответ
         conversation_context[user_id].append({"role": "assistant", "content": answer})
-        logging.info(f"Ответ специалиста для пользователя {user_id}: {answer}")
 
-        # Отправляем ответ вместе с кнопкой для завершения диалога
-        markup = telebot.types.InlineKeyboardMarkup()
-        end_dialog_button = telebot.types.InlineKeyboardButton(text="Завершить диалог", callback_data="end_dialog")
-        markup.add(end_dialog_button)
-        bot.send_message(user_id, f"🔮 Ответ специалиста:\n\n{answer}", reply_markup=markup)
+        end_dialog_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Завершить диалог",
+                        callback_data="end_dialog"
+                    )
+                ]
+            ]
+        )
+
+        await message.answer(
+            f"🔮 Ответ специалиста:\n\n{answer}", 
+            reply_markup=end_dialog_keyboard
+        )
 
     except Exception as e:
-        logging.exception(f"🚨 Ошибка при запросе к Gemini в режиме диалога: {str(e)}")
-        bot.send_message(user_id, "🚨 Ошибка при обработке запроса. Попробуйте позже.")
+        logging.exception(f"🚨 Ошибка при запросе к Gemini (диалог): {str(e)}")
+        await message.answer("🚨 Ошибка при обработке запроса. Попробуйте позже.")
 
-# ========= Обработчик нажатия кнопки "Завершить диалог" =========
-@bot.callback_query_handler(func=lambda call: call.data == "end_dialog")
-def end_dialog_handler(call):
+@router.callback_query(F.data == "end_dialog")
+async def end_dialog_handler(call: CallbackQuery):
     user_id = call.message.chat.id
     if user_id in conversation_context:
         del conversation_context[user_id]
-        logging.info(f"Диалог для пользователя {user_id} завершён и контекст удалён.")
-    bot.send_message(user_id, "Диалог завершен. Если потребуется помощь, вы можете начать новую консультацию.")
+        logging.info(f"Диалог для пользователя {user_id} завершён, контекст удалён.")
+    await call.message.answer("Диалог завершен. Если потребуется помощь, вы можете начать новую консультацию.")
 
+# ================== Точка входа ==================
 
-# 🔹 Запуск бота
-if __name__ == '__main__':
-    print("🚀 Бот запущен...")
-    bot.polling(none_stop=True)
+async def main():
+    """Главная асинхронная функция"""
+    logging.info("🚀 Бот запускается...")
+
+    # Регистрируем роутер с обработчиками
+    dp.include_router(router)
+
+    # Запускаем поллинг
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 
