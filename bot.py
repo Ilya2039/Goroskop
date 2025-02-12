@@ -20,6 +20,10 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from yoomoney import Client
+import psycopg2
+import io
+from aiogram.types import BufferedInputFile
+from aiogram.filters import Command
 
 # Если нужно использовать Google Gemini:
 # from google import genai
@@ -51,50 +55,226 @@ translator = Translator()
 
 # ================== База данных ==================
 
+POSTGRES_USER = "postgres"
+POSTGRES_PASSWORD = "BecomeMillioners48"
+POSTGRES_DB = "postgres"
+POSTGRES_HOST = "localhost"  # или IP вашего сервера
+POSTGRES_PORT = "5432"
+
+def get_connection():
+    """
+    Создаёт и возвращает соединение с PostgreSQL.
+    Не забывайте закрывать его после использования.
+    """
+    return psycopg2.connect(
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT
+    )
+
+
+# ================== База данных ==================
 def init_db():
-    """Инициализация базы данных SQLite (синхронно, вызывается один раз при старте)."""
-    conn = sqlite3.connect(DB_NAME)
+    """
+    Инициализация базы данных PostgreSQL (синхронно, вызывается один раз при старте).
+    Создает таблицу users, если её нет.
+    """
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL UNIQUE,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL UNIQUE,
             username TEXT,
             first_name TEXT,
             last_name TEXT,
+            free_consultation_used BOOLEAN NOT NULL DEFAULT FALSE,
+            balance NUMERIC(10,2) NOT NULL DEFAULT 0.00,
             date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
 def add_user(user_id, username, first_name, last_name):
-    """Добавление пользователя в БД (синхронно)."""
-    conn = sqlite3.connect(DB_NAME)
+    """
+    Добавление пользователя в БД (синхронно). 
+    """
+    conn = get_connection()
     cursor = conn.cursor()
-
     try:
         cursor.execute("""
             INSERT INTO users (user_id, username, first_name, last_name)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (user_id, username, first_name, last_name))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass  # Если пользователь уже существует
-    
-    conn.close()
-
-''' Начало админки '''
-
-ADMIN_IDS = [2089704895]
+    except Exception as e:
+        # Можно отлавливать конкретное исключение уникальности:
+        # if isinstance(e, UniqueViolation):
+        #     pass
+        logging.warning(f"Ошибка при добавлении пользователя {user_id}: {e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
 
 def get_user_count():
-    conn = sqlite3.connect(DB_NAME)
+    """
+    Возвращает количество пользователей в таблице users.
+    """
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM users")
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row[0] if row else 0
+
+def has_used_free_consultation(user_id: int) -> bool:
+    """
+    Возвращает True, если пользователь уже использовал бесплатную консультацию.
+    Если пользователя нет в таблице, по умолчанию считаем, что не использовал.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT free_consultation_used
+        FROM users
+        WHERE user_id = %s
+        """,
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if row is None:
+        # Пользователя нет, значит он ещё не зарегистрирован
+        return False
+    return row[0]  # Это значение BOOLEAN
+
+def set_free_consultation_used(user_id: int, used: bool):
+    """
+    Устанавливает флаг free_consultation_used для данного user_id.
+    Если пользователя нет в базе, можно сначала add_user(...) или проигнорировать.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE users
+        SET free_consultation_used = %s
+        WHERE user_id = %s
+        """,
+        (used, user_id)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def get_balance(user_id: int) -> float:
+    """
+    Возвращает текущий баланс пользователя в рублях.
+    Если пользователя нет, возвращает 0.0
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT balance
+        FROM users
+        WHERE user_id = %s
+        """,
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if row is None:
+        return 0.0
+    return float(row[0])
+
+def add_to_balance(user_id: int, amount: float):
+    """
+    Прибавляет заданную сумму к балансу пользователя.
+    Если такого пользователя нет, вы можете сначала вызывать add_user(...) или проигнорировать ошибку.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE users
+        SET balance = balance + %s
+        WHERE user_id = %s
+        """,
+        (amount, user_id)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_all_users():
+    """
+    Возвращает список всех user_id из таблицы users.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [row[0] for row in rows]
+
+# ================== Админка ==================
+ADMIN_IDS = [2089704895]
+
+def get_all_users_data():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, first_name, last_name, date_added FROM users")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
+
+
+@router.message(Command("list_users"))
+async def list_users(message: Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return  # Игнорируем, если не админ
+
+    rows = get_all_users_data()  # [(user_id, username, first_name, last_name, date_added), ...]
+
+    if not rows:
+        await message.answer("Пока что никто не зарегистрирован.")
+        return
+
+    # 1. Создаём байтовый буфер в оперативной памяти
+    buffer = io.BytesIO()
+
+    # 2. Заполняем его строками (в байтах)
+    for row in rows:
+        user_id_db = row[0]  # Предполагаем, что это user_id
+        line = f"{user_id_db}\n"
+        buffer.write(line.encode("utf-8"))
+
+    # 3. Возвращаем «указатель» в начало буфера
+    buffer.seek(0)
+
+    # 4. Преобразуем содержимое буфера в bytes,
+    #    т.к. BufferedInputFile ждёт просто «сырые» байты.
+    file_bytes = buffer.getvalue()
+
+    # 5. Создаём объект BufferedInputFile
+    #    filename="user_ids.txt" — это имя, которое будет видно при загрузке
+    file_to_send = BufferedInputFile(
+        file=file_bytes,
+        filename="user_ids.txt"
+    )
+
+    # 6. Отправляем документ
+    await message.answer_document(document=file_to_send)
 
 @router.message(Command("stats"))
 async def stats_command(message: Message):
@@ -103,25 +283,18 @@ async def stats_command(message: Message):
     
     # Проверяем, является ли пользователь админом
     if user_id not in ADMIN_IDS:
-        return
-    
+        return  # Игнорируем запрос
+
     # Если админ, выводим количество пользователей
     count = get_user_count()
     await message.answer(f"Количество пользователей в боте: {count}")
+
 
 class MailingStates(StatesGroup):
     WAITING_FOR_TEXT = State()
     WAITING_FOR_CONFIRMATION = State()
     WAITING_FOR_BUTTON = State()
 
-# Функция для получения списка user_id из БД
-def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return users
 
 @router.message(Command("mailing"))
 async def start_mailing(message: Message, state: FSMContext):
@@ -130,12 +303,12 @@ async def start_mailing(message: Message, state: FSMContext):
         return  # Если не админ, игнорируем
     
     await message.answer("📢 Введите текст рассылки (или отправьте фото с подписью).")
-    await state.set_state(MailingStates.WAITING_FOR_TEXT)  # Установили состояние "ждем текст"
+    await state.set_state(MailingStates.WAITING_FOR_TEXT)
+
 
 # ------------------------------
 # Хендлер, который ловит текст/фото при состоянии WAITING_FOR_TEXT
 # ------------------------------
-# Хендлер для обработки текста или фото
 @router.message(StateFilter(MailingStates.WAITING_FOR_TEXT))
 async def process_mailing_text_or_photo(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -157,7 +330,7 @@ async def process_mailing_text_or_photo(message: Message, state: FSMContext):
     await message.answer("✅ Текст принят. Хотите добавить кнопку? (да/нет)")
     await state.set_state(MailingStates.WAITING_FOR_BUTTON)
 
-# Хендлер для обработки кнопки или пропуска
+# Хендлер для кнопки или пропуска
 @router.message(StateFilter(MailingStates.WAITING_FOR_BUTTON))
 async def process_mailing_button(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -171,18 +344,20 @@ async def process_mailing_button(message: Message, state: FSMContext):
         await message.answer("✅ Кнопка пропущена. Запустить рассылку? (да/нет)")
         await state.set_state(MailingStates.WAITING_FOR_CONFIRMATION)
     else:
+        # Предполагаем, что здесь пользователь сразу прислал "Текст кнопки | Ссылка"
         if "|" in response:
             button_text, button_url = map(str.strip, response.split("|", 1))
             if not button_url.startswith("http"):
                 await message.answer("❌ Неверная ссылка! Укажите полный URL (http/https).")
                 return
             await state.update_data(button=(button_text, button_url))
+
         await message.answer("✅ Кнопка добавлена. Запустить рассылку? (да/нет)")
         await state.set_state(MailingStates.WAITING_FOR_CONFIRMATION)
 
-# Хендлер подтверждения рассылки
+
 @router.message(StateFilter(MailingStates.WAITING_FOR_CONFIRMATION))
-async def confirm_mailing(message: Message, state: FSMContext, bot: Bot):
+async def confirm_mailing(message: Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id not in ADMIN_IDS:
         return
@@ -200,13 +375,16 @@ async def confirm_mailing(message: Message, state: FSMContext, bot: Bot):
     markup = None
     if button_data:
         button_text, button_url = button_data
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, url=button_url)]])
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=button_text, url=button_url)]]
+        )
 
     await message.answer("📤 Начинаю рассылку...")
-    
+
+    # Рассылаем всем
     users = get_all_users()
     success, failed = 0, 0
-    
+
     for user in users:
         try:
             if photo_id:
@@ -217,7 +395,7 @@ async def confirm_mailing(message: Message, state: FSMContext, bot: Bot):
         except Exception as e:
             failed += 1
             logging.warning(f"Ошибка отправки пользователю {user}: {e}")
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)  # Небольшая пауза между отправками
 
     await message.answer(f"✅ Рассылка завершена!\n✔️ Отправлено: {success}\n❌ Ошибок: {failed}")
     await state.clear()
@@ -510,6 +688,11 @@ def check_payment_received(label: str, amount: float) -> bool:
 # from aiogram import Router
 # router = Router()
 
+from datetime import datetime, timedelta
+
+# Словарь для хранения времени начала диалога
+dialogue_start_times = {}
+
 @router.callback_query(F.data == "consultation")
 async def consultation_menu(call: CallbackQuery):
     """
@@ -542,7 +725,7 @@ async def consultation_menu(call: CallbackQuery):
 
     await bot.send_chat_action(user_id, action='typing')
     await call.message.answer("⌛ Ищу специалиста...")
-    await asyncio.sleep(3)
+    await asyncio.sleep(10)
 
     await call.message.answer(
         "✅ Специалист найден! Напишите свой вопрос очень подробно, чтобы Таролог мог дать точный ответ."
@@ -678,14 +861,18 @@ async def receive_user_query(message: Message):
     )
     del user_queries[user_id]
 
-
 @router.callback_query(F.data == "start_dialog")
 async def start_dialog_handler(call: CallbackQuery):
     """
-    Начинаем диалог на несколько сообщений.
+    Начинаем диалог. Будет действовать 30 минут.
     """
     user_id = call.message.chat.id
+    
+    # Инициализируем контекст диалога
     conversation_context[user_id] = []
+    # Запоминаем время начала диалога
+    dialogue_start_times[user_id] = datetime.now()
+    
     logging.info(f"Диалог для пользователя {user_id} инициализирован.")
 
     end_dialog_keyboard = InlineKeyboardMarkup(
@@ -700,32 +887,50 @@ async def start_dialog_handler(call: CallbackQuery):
     )
     await call.message.answer(
         "Диалог начат. Пожалуйста, введите ваше сообщение. "
-        "Чтобы завершить диалог, нажмите кнопку ниже.",
+        "Чтобы завершить диалог раньше, нажмите кнопку ниже.",
         reply_markup=end_dialog_keyboard
     )
 
 @router.message(lambda m: m.chat.id in conversation_context)
 async def dialogue_message_handler(message: Message):
     """
-    Обработка сообщений в диалоге (ограничено N вопросами).
+    Обработка сообщений в диалоге. Диалог длится не более 30 минут.
     """
     user_id = message.chat.id
-    user_msg = message.text.strip()
+    user_msg = message.text.strip() if message.text else ""
 
+    # Если пользователь отправил пустое сообщение
     if not user_msg:
         await message.answer("❌ Сообщение пусто. Пожалуйста, введите корректный текст.")
         return
 
+    # Если по какой-то причине нет времени начала (например, диалог уже завершен)
+    if user_id not in dialogue_start_times:
+        await message.answer("Диалог неактивен. Начните новый диалог, если нужна консультация.")
+        return
+    
+    # Проверяем, не истекли ли 30 минут
+    start_time = dialogue_start_times[user_id]
+    now = datetime.now()
+    if now - start_time > timedelta(minutes=30):
+        # Завершаем диалог
+        await message.answer(
+            "Диалог автоматически завершён, так как прошло более 30 минут с момента начала.\n"
+            "Если потребуется помощь, вы можете начать новую консультацию."
+        )
+        # Очищаем данные
+        del conversation_context[user_id]
+        del dialogue_start_times[user_id]
+        return
+
+    # Если всё в порядке — продолжаем диалог
     conversation_context[user_id].append({"role": "user", "content": user_msg})
-    user_question_count = sum(1 for msg in conversation_context[user_id] if msg["role"] == "user")
 
     await bot.send_chat_action(user_id, action='typing')
     await asyncio.sleep(2)
 
-    # Пример "ответа" от гемини (или заглушка):
     try:
         base_prompt = ("Ты — профессиональный таролог ...\n\nДиалог:\n")
-        # Собираем историю
         dialogue_history = ""
         for msg in conversation_context[user_id]:
             if msg["role"] == "user":
@@ -747,6 +952,7 @@ async def dialogue_message_handler(message: Message):
         logging.exception(f"🚨 Ошибка при запросе к Gemini (диалог): {str(e)}")
         answer = "🚨 Ошибка при обработке запроса. Попробуйте позже."
 
+    # Добавляем ответ в контекст
     conversation_context[user_id].append({"role": "assistant", "content": answer})
 
     end_dialog_keyboard = InlineKeyboardMarkup(
@@ -760,30 +966,29 @@ async def dialogue_message_handler(message: Message):
         ]
     )
 
-    # Допустим, хотим максимум 5 сообщений от пользователя
-    if user_question_count >= 2:
-        await message.answer(
-            f"🔮 Ответ специалиста:\n\n{answer}\n\n"
-            "Диалог завершен, вы задали максимальное кол-во запросов."
-        )
-        del conversation_context[user_id]
-    else:
-        await message.answer(
-            f"🔮 Ответ специалиста:\n\n{answer}",
-            reply_markup=end_dialog_keyboard
-        )
+    await message.answer(
+        f"🔮 Ответ специалиста:\n\n{answer}",
+        reply_markup=end_dialog_keyboard
+    )
 
 @router.callback_query(F.data == "end_dialog")
 async def end_dialog_handler(call: CallbackQuery):
     """
-    Принудительное завершение диалога.
+    Принудительное завершение диалога по нажатию кнопки.
     """
     user_id = call.message.chat.id
+    
+    # Удаляем контекст, если он есть
     if user_id in conversation_context:
         del conversation_context[user_id]
-        logging.info(f"Диалог для пользователя {user_id} завершён, контекст удалён.")
-    await call.message.answer("Диалог завершен. Если потребуется помощь, вы можете начать новую консультацию.")
+    
+    if user_id in dialogue_start_times:
+        del dialogue_start_times[user_id]
 
+    logging.info(f"Диалог для пользователя {user_id} завершён, контекст удалён.")
+    await call.message.answer(
+        "Диалог завершен. Если потребуется помощь, вы можете начать новую консультацию."
+    )
 
 # ================== Точка входа ==================
 
@@ -801,6 +1006,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
