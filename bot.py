@@ -19,6 +19,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from yoomoney import Client
 
 # Если нужно использовать Google Gemini:
 # from google import genai
@@ -26,10 +27,10 @@ from aiogram.fsm.state import State, StatesGroup
 
 # ================== Константы / настройки ==================
 
-API_TOKEN = '7582972873:AAGX0VJea8BdfGpV_QLvU3sBtXZi9L-xNrw'
-TAROT_APP_URL = 'https://e04c-169-150-209-163.ngrok-free.app/tarot/'
-NATAL_APP_URL = 'https://e04c-169-150-209-163.ngrok-free.app/natal/'
-flask_url = "https://e04c-169-150-209-163.ngrok-free.app/horoscope/today"
+API_TOKEN = '8136585514:AAH2Pu0bWiNqBklVWPOiF2RaJBHxzMtLjfk'
+TAROT_APP_URL = 'https://d6c1-169-150-209-163.ngrok-free.app/tarot/'
+NATAL_APP_URL = 'https://d6c1-169-150-209-163.ngrok-free.app/natal/'
+flask_url = "https://d6c1-169-150-209-163.ngrok-free.app/horoscope/today"
 GEMINI_API_KEY = "AIzaSyCqE4taBEs1GJUh_pJQUqdGgcSEfGL8Pbc"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -426,28 +427,202 @@ async def handle_zodiac_choice(call: CallbackQuery):
 
 user_queries = {}         # { user_id: str|None } для первоначального запроса консультации
 conversation_context = {} # { user_id: [ {role: "user"/"assistant", content: str}, ... ] }
+free_consultation_used = set()  # пользователи, которые уже воспользовались бесплатной консультацией
+
+# Твой токен YooMoney
+# *** НАСТРОЙКА ЮMONEY ***
+
+# 1) Номер вашего кошелька (обязательно). Формат обычно 4100XXXXXXXXXXXX.
+YOOMONEY_WALLET = "4100117426905137"
+
+# 2) OAuth-токен, полученный через yoomoney.Authorize(...), с нужными правами:
+#    ["account-info", "operation-history", "operation-details", "payment-p2p", "payment-shop"]
+YOOMONEY_OAUTH_TOKEN = "4100117426905137.EC1D8A38937E3F0CD1D7CBE9CCAF94E3507AA66D2BB0CF7E32282679BF7CF6E824ACF8FAEE30E31B2FFBF45742D12AAF2884133FAF32F3F854C2431A1B555E92AA3512C4C1FF105964B8A5599BA7942FAFBCD49A059DDF9743B534284B9931AE2B61DA3F02EA4F499B16065EA42CDB444799E016A14C9A247A5D761E27BAA560"
+
+# Создаём клиента для запросов к API ЮMoney (проверка поступлений).
+yoomoney_client = Client(YOOMONEY_OAUTH_TOKEN)
+
+# Словарь для хранения данных об ожидании оплаты:
+# { user_id: { "label": str, "amount": float, ... } }
+pending_payments = {}
+
+def create_yoomoney_quickpay_link(amount: float, user_id: int) -> tuple[str, str]:
+    """
+    Генерирует ссылку Quick Pay для перевода 'amount' рублей на YOOMONEY_WALLET.
+    Возвращает (link, label).
+      label - уникальная метка, чтобы потом проверить оплату в history.
+    """
+    label = f"tarot_{user_id}_pay"
+    targets = f"Tarot Consultation user {user_id}"
+
+    base_url = "https://yoomoney.ru/quickpay/confirm.xml"
+    link = (
+        f"{base_url}?receiver={YOOMONEY_WALLET}"
+        f"&quickpay-form=shop"
+        f"&targets={targets}"
+        f"&paymentType=AC"        # прием с банковской карты
+        f"&sum={amount}"
+        f"&label={label}"
+    )
+    return link, label
+
+def check_payment_received(label: str, amount: float) -> bool:
+    """
+    Запрашивает operation_history в ЮMoney и ищет операцию со статусом success и label=label.
+    Проверяет, что сумма не меньше нужной (>= amount).
+    Возвращает True, если платёж найден.
+    """
+    try:
+        # Запрашиваем историю операций (до 30 последних)
+        history = yoomoney_client.operation_history(records=30)
+
+        # Получаем список операций
+        operations = history.operations
+
+        # Логируем для диагностики
+        logging.info(f"Найдено операций: {len(operations)}")
+
+        for op in operations:
+            # Проверяем, есть ли атрибут `label` (не все операции имеют метку)
+            op_label = getattr(op, "label", None)
+            op_status = getattr(op, "status", None)
+            op_amount = getattr(op, "amount", 0)
+
+            logging.info(f"Проверяем операцию: Label={op_label}, Status={op_status}, Amount={op_amount}")
+
+            # Сравниваем метку и статус
+            if op_label == label and op_status == "success":
+                # Проверяем, что сумма не меньше 45 (с учётом возможной комиссии)
+                if float(op_amount) >= 45:
+                    logging.info(f"✅ Оплата найдена: {op_label}, {op_status}, {op_amount}")
+                    return True
+
+        logging.info("❌ Оплата не найдена.")
+        return False
+
+    except Exception as e:
+        logging.exception(f"Ошибка в check_payment_received: {e}")
+        return False
+
+
+# ============ Пример использования "router" (aiogram 3.x) ============
+# Предполагаем, что router у вас уже создан. Если нет:
+# from aiogram import Router
+# router = Router()
 
 @router.callback_query(F.data == "consultation")
 async def consultation_menu(call: CallbackQuery):
-    """Запрос консультации"""
+    """
+    Обработка нажатия кнопки "Консультация".
+    - Если пользователь уже воспользовался бесплатной, предлагаем оплату.
+    - Иначе даём 1 бесплатный вопрос.
+    """
     user_id = call.message.chat.id
 
-    # Показываем "печатает..." и отправляем сообщение
+    if user_id in free_consultation_used:
+        # Уже использовал бесплатную — предлагаем оплату
+        payment_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Оплатить 50 руб.",
+                        callback_data="pay_consultation"
+                    )
+                ]
+            ]
+        )
+        await call.message.answer(
+            "Консультация платная. Для продолжения, пожалуйста, оплатите 50 рублей.",
+            reply_markup=payment_keyboard
+        )
+        return
+
+    # Еще не пользовался бесплатной консультацией
+    free_consultation_used.add(user_id)
+
     await bot.send_chat_action(user_id, action='typing')
     await call.message.answer("⌛ Ищу специалиста...")
+    await asyncio.sleep(3)
 
-    # Теперь асинхронно "ждем" 10 секунд (пример), не блокируя других
-    await asyncio.sleep(10)
+    await call.message.answer(
+        "✅ Специалист найден! Напишите свой вопрос очень подробно, чтобы Таролог мог дать точный ответ."
+    )
+    user_queries[user_id] = None
 
-    await call.message.answer("✅ Специалист найден! Напишите свой вопрос очень подробно, чтобы Таролог мог дать точный ответ.")
-    user_queries[user_id] = None  # Фиксируем, что ждем первый вопрос
+
+@router.callback_query(F.data == "pay_consultation")
+async def pay_consultation_handler(call: CallbackQuery):
+    """
+    Кнопка "Оплатить 50 руб." - генерируем ссылку Quick Pay, предлагаем оплатить,
+    показываем кнопку "Я оплатил, проверить".
+    """
+    user_id = call.message.chat.id
+    pay_link, label = create_yoomoney_quickpay_link(amount=50.0, user_id=user_id)
+
+    # Сохраняем инфо, что этот user_id должен оплатить (label, amount)
+    pending_payments[user_id] = {
+        "label": label,
+        "amount": 50.0
+    }
+
+    payment_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Оплатить через ЮMoney (50 руб.)",
+                    url=pay_link
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Я оплатил, проверить",
+                    callback_data="check_payment"
+                )
+            ]
+        ]
+    )
+    await call.message.answer(
+        "Для продолжения консультации, пожалуйста, оплатите 50 рублей по ссылке выше. "
+        "Затем нажмите «Я оплатил, проверить».",
+        reply_markup=payment_keyboard
+    )
+
+@router.callback_query(F.data == "check_payment")
+async def check_payment_handler(call: CallbackQuery):
+    """
+    Кнопка "Я оплатил, проверить". Смотрим в pending_payments, 
+    вызываем check_payment_received(...).
+    """
+    user_id = call.message.chat.id
+    pay_info = pending_payments.get(user_id)
+    if not pay_info:
+        await call.message.answer("Нет данных о платеже для этого пользователя.")
+        return
+
+    label = pay_info["label"]
+    amount = pay_info["amount"]
+
+    paid = check_payment_received(label=label, amount=amount)
+    if paid:
+        await call.message.answer("Оплата подтверждена! Можете продолжить консультацию.")
+        # Удаляем запись, чтобы не проверять повторно
+        del pending_payments[user_id]
+        if user_id in free_consultation_used:
+            free_consultation_used.remove(user_id)
+    else:
+        await call.message.answer(
+            "Оплата не найдена или не завершена. Убедитесь, что платеж прошёл, "
+            "или попробуйте проверить ещё раз позже."
+        )
 
 @router.message(lambda m: m.chat.id in user_queries and user_queries[m.chat.id] is None)
 async def receive_user_query(message: Message):
-    """Обработчик первого запроса пользователя для консультации"""
+    """
+    Первый бесплатный вопрос пользователя (до диалога).
+    """
     user_id = message.chat.id
     query_text = message.text.strip() if message.text else ""
-    
+
     if not query_text:
         await message.answer("❌ Ваш вопрос пуст. Пожалуйста, введите корректный запрос.")
         return
@@ -455,88 +630,124 @@ async def receive_user_query(message: Message):
     user_queries[user_id] = query_text
     await message.answer("⌛ Ждем ответ специалиста...")
     await bot.send_chat_action(user_id, action='typing')
+    await asyncio.sleep(3)
 
-    # Эмуляция «ожидания» ответа 5 секунд
-    await asyncio.sleep(20)
-
-    # Пример системного prompt
-    system_prompt = (
-    "Ты — профессиональный таролог с многолетним опытом гадания на картах Таро. "
-    "Ты толкуешь карты, используя традиционные расклады и глубокие знания эзотерики. "
-    "Говори убедительно, таинственно, без лишних упоминаний про свободу воли или то, что итоговое решение за пользователем. "
-    "Пиши, как настоящий мистик, который уверен в правдивости своих слов.\n\n"
-    "🔮 **Как должен выглядеть твой ответ:**\n"
-    "- Опиши, какие карты выпали (например, «Вам выпал Аркан ‘Суд’ в перевёрнутом положении…»).\n"
-    "- Объясни значение карт в контексте заданного вопроса.\n"
-    "- Определи, что карты говорят о прошлом, настоящем и будущем ситуации.\n"
-    "- Дай осмысленные советы человеку, исходя из карт.\n"
-    "- Если вопрос касается выбора (например, уйти с работы или остаться), укажи возможные сценарии.\n"
-    "- Поддерживай **мистический, но при этом уверенный стиль ответа**.\n"
-    "- Не перечисляй советы списками (без «1.» или «-»), не давай дисклеймеров и не упоминай «окончательное решение за вами».\n\n"
-    "Если предоставленной информации недостаточно для точного предсказания, попроси пользователя рассказать подробнее о своей ситуации, "
-    "уточнить детали или задать дополнительные вопросы, чтобы дать более точный прогноз.\n\n"
-    "Учти, что это — диалог. Формируй ответы, опираясь на всю историю беседы, но избегай нумерованных пунктов. "
-    "Пиши в одном потоке, используй мистические метафоры и эзотерические образы.\n\n"
-    "Диалог:\n"
-)
-    
-    full_prompt = (
-        system_prompt
-        + f"Пользователь: {query_text}\n"
-        + "Таролог:"
-    )
-
+    # Здесь примеры для вашей гемини-модели (заглушка или реальный вызов)
     try:
+        # Сформировали prompt (пример)
+        system_prompt = ("Ты — профессиональный таролог ...\n\n")
+        full_prompt = f"{system_prompt}Пользователь: {query_text}\nТаролог:"
+
         # Пример вызова к Gemini:
         response = gemini_client.models.generate_content(
-             model="gemini-2.0-flash-exp",
-             contents=full_prompt
+            model="gemini-2.0-flash-exp",
+            contents=full_prompt
         )
         if hasattr(response, 'text') and response.text:
             answer = response.text.strip()
         else:
             answer = "Я не смог получить ответ от специалиста. Попробуйте позже."
 
-        # Пока заглушка
-        # answer = "🔮 [Пример ответа специалиста] Карты говорят, что ..."
-
-        await message.answer(f"🔮 Ответ специалиста:\n\n{answer}")
-
-        # Сохраняем историю диалога
-        conversation_context[user_id] = [
-            {"role": "user", "content": query_text},
-            {"role": "assistant", "content": answer}
-        ]
-
-        # Клавиатура для начала полноценного диалога
-        dialog_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Начать диалог",
-                        callback_data="start_dialog"
-                    )
-                ]
-            ]
-        )
-        await message.answer(
-            "Если хотите продолжить диалог со специалистом, нажмите кнопку ниже.",
-            reply_markup=dialog_keyboard
-        )
-
     except Exception as e:
         logging.exception(f"🚨 Ошибка при запросе к Gemini: {str(e)}")
-        await message.answer("🚨 Ошибка при обработке запроса. Попробуйте позже.")
+        answer = "🚨 Ошибка при обработке запроса. Попробуйте позже."
 
-    # Удаляем из user_queries, чтобы не мешало следующему первому вопросу
+    # Отправляем ответ
+    await message.answer(f"🔮 Ответ специалиста:\n\n{answer}")
+
+    # Сохраняем историю
+    conversation_context[user_id] = [
+        {"role": "user", "content": query_text},
+        {"role": "assistant", "content": answer}
+    ]
+
+    # Предлагаем начать диалог
+    dialog_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Начать диалог",
+                    callback_data="start_dialog"
+                )
+            ]
+        ]
+    )
+    await message.answer(
+        "Если хотите продолжить диалог со специалистом, нажмите кнопку ниже.",
+        reply_markup=dialog_keyboard
+    )
     del user_queries[user_id]
+
 
 @router.callback_query(F.data == "start_dialog")
 async def start_dialog_handler(call: CallbackQuery):
+    """
+    Начинаем диалог на несколько сообщений.
+    """
     user_id = call.message.chat.id
-    if user_id not in conversation_context:
-        conversation_context[user_id] = []
-        logging.info(f"Диалог для пользователя {user_id} инициализирован (пуст).")
+    conversation_context[user_id] = []
+    logging.info(f"Диалог для пользователя {user_id} инициализирован.")
+
+    end_dialog_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Завершить диалог",
+                    callback_data="end_dialog"
+                )
+            ]
+        ]
+    )
+    await call.message.answer(
+        "Диалог начат. Пожалуйста, введите ваше сообщение. "
+        "Чтобы завершить диалог, нажмите кнопку ниже.",
+        reply_markup=end_dialog_keyboard
+    )
+
+@router.message(lambda m: m.chat.id in conversation_context)
+async def dialogue_message_handler(message: Message):
+    """
+    Обработка сообщений в диалоге (ограничено N вопросами).
+    """
+    user_id = message.chat.id
+    user_msg = message.text.strip()
+
+    if not user_msg:
+        await message.answer("❌ Сообщение пусто. Пожалуйста, введите корректный текст.")
+        return
+
+    conversation_context[user_id].append({"role": "user", "content": user_msg})
+    user_question_count = sum(1 for msg in conversation_context[user_id] if msg["role"] == "user")
+
+    await bot.send_chat_action(user_id, action='typing')
+    await asyncio.sleep(2)
+
+    # Пример "ответа" от гемини (или заглушка):
+    try:
+        base_prompt = ("Ты — профессиональный таролог ...\n\nДиалог:\n")
+        # Собираем историю
+        dialogue_history = ""
+        for msg in conversation_context[user_id]:
+            if msg["role"] == "user":
+                dialogue_history += f"Пользователь: {msg['content']}\n"
+            else:
+                dialogue_history += f"Специалист: {msg['content']}\n"
+
+        full_prompt = f"{base_prompt}{dialogue_history}\nСпециалист:"
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=full_prompt
+        )
+        if hasattr(response, 'text') and response.text:
+            answer = response.text.strip()
+        else:
+            answer = "Сейчас не могу ответить, попробуйте позднее."
+
+    except Exception as e:
+        logging.exception(f"🚨 Ошибка при запросе к Gemini (диалог): {str(e)}")
+        answer = "🚨 Ошибка при обработке запроса. Попробуйте позже."
+
+    conversation_context[user_id].append({"role": "assistant", "content": answer})
 
     end_dialog_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -549,103 +760,30 @@ async def start_dialog_handler(call: CallbackQuery):
         ]
     )
 
-    await call.message.answer(
-        "Диалог начат. Пожалуйста, введите ваше сообщение. "
-        "Чтобы завершить диалог, нажмите кнопку ниже.",
-        reply_markup=end_dialog_keyboard
-    )
-
-@router.message(lambda m: m.chat.id in conversation_context)
-async def dialogue_message_handler(message: Message):
-    """Обработка сообщений, пока пользователь находится в диалоге."""
-    user_id = message.chat.id
-    user_msg = message.text.strip()
-
-    if not user_msg:
-        await message.answer("❌ Сообщение пусто. Пожалуйста, введите корректный текст.")
-        return
-
-    logging.info(f"Сообщение в диалоге от {user_id}: {user_msg}")
-
-    # Добавляем в историю
-    conversation_context[user_id].append({"role": "user", "content": user_msg})
-
-    # Базовый промпт для диалога
-    base_prompt = (
-    "Ты — профессиональный таролог с многолетним опытом гадания на картах Таро. "
-    "Ты толкуешь карты, используя традиционные расклады и глубокие знания эзотерики. "
-    "Говори убедительно, таинственно, без лишних упоминаний про свободу воли или то, что итоговое решение за пользователем. "
-    "Пиши, как настоящий мистик, который уверен в правдивости своих слов.\n\n"
-    "🔮 **Как должен выглядеть твой ответ:**\n"
-    "- Опиши, какие карты выпали (например, «Вам выпал Аркан ‘Суд’ в перевёрнутом положении…»).\n"
-    "- Объясни значение карт в контексте заданного вопроса.\n"
-    "- Определи, что карты говорят о прошлом, настоящем и будущем ситуации.\n"
-    "- Дай осмысленные советы человеку, исходя из карт.\n"
-    "- Если вопрос касается выбора (например, уйти с работы или остаться), укажи возможные сценарии.\n"
-    "- Поддерживай **мистический, но при этом уверенный стиль ответа**.\n"
-    "- Не перечисляй советы списками (без «1.» или «-»), не давай дисклеймеров и не упоминай «окончательное решение за вами».\n\n"
-    "Если предоставленной информации недостаточно для точного предсказания, попроси пользователя рассказать подробнее о своей ситуации, "
-    "уточнить детали или задать дополнительные вопросы, чтобы дать более точный прогноз.\n\n"
-    "Учти, что это — диалог. Формируй ответы, опираясь на всю историю беседы, но избегай нумерованных пунктов. "
-    "Пиши в одном потоке, используй мистические метафоры и эзотерические образы.\n\n"
-    "Диалог:\n"
-)
-
-    # Собираем историю
-    dialogue_history = ""
-    for msg in conversation_context[user_id]:
-        if msg["role"] == "user":
-            dialogue_history += f"Пользователь: {msg['content']}\n"
-        else:
-            dialogue_history += f"Специалист: {msg['content']}\n"
-
-    full_prompt = base_prompt + "\n\nИстория:\n" + dialogue_history
-
-    await bot.send_chat_action(user_id, action='typing')
-
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=full_prompt
-        )
-
-        if hasattr(response, 'text') and response.text:
-            answer = response.text.strip()
-        else:
-            answer = "Я не смог получить ответ от специалиста. Попробуйте позже."
-        await asyncio.sleep(1)
-        # answer = "🔮 [Пример ответа в диалоге] Я вижу, что карты указывают ..."
-
-        # Сохраняем ответ
-        conversation_context[user_id].append({"role": "assistant", "content": answer})
-
-        end_dialog_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Завершить диалог",
-                        callback_data="end_dialog"
-                    )
-                ]
-            ]
-        )
-
+    # Допустим, хотим максимум 5 сообщений от пользователя
+    if user_question_count >= 2:
         await message.answer(
-            f"🔮 Ответ специалиста:\n\n{answer}", 
+            f"🔮 Ответ специалиста:\n\n{answer}\n\n"
+            "Диалог завершен, вы задали максимальное кол-во запросов."
+        )
+        del conversation_context[user_id]
+    else:
+        await message.answer(
+            f"🔮 Ответ специалиста:\n\n{answer}",
             reply_markup=end_dialog_keyboard
         )
 
-    except Exception as e:
-        logging.exception(f"🚨 Ошибка при запросе к Gemini (диалог): {str(e)}")
-        await message.answer("🚨 Ошибка при обработке запроса. Попробуйте позже.")
-
 @router.callback_query(F.data == "end_dialog")
 async def end_dialog_handler(call: CallbackQuery):
+    """
+    Принудительное завершение диалога.
+    """
     user_id = call.message.chat.id
     if user_id in conversation_context:
         del conversation_context[user_id]
         logging.info(f"Диалог для пользователя {user_id} завершён, контекст удалён.")
     await call.message.answer("Диалог завершен. Если потребуется помощь, вы можете начать новую консультацию.")
+
 
 # ================== Точка входа ==================
 
