@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, render_template
 from google import genai
-from googletrans import Translator  # Импортируем переводчик
+from translatepy import Translator
+  # Импортируем переводчик
 import logging
 
 app = Flask(__name__)
@@ -52,10 +53,10 @@ def natal_gemini():
             logging.info(f"Ответ от Gemini: {result}")
 
             # Переводим ответ на русский
-            translated_result = translator.translate(result, src='en', dest='ru').text
+            translated_result = translator.translate(result, "ru")
             logging.info(f"Переведенный ответ: {translated_result}")
 
-            return jsonify({'answer': translated_result})
+            return jsonify({'answer': str(translated_result.result)})
         else:
             logging.error("Gemini вернул пустой ответ")
             return jsonify({'error': 'Empty response from Gemini'}), 500
@@ -64,21 +65,16 @@ def natal_gemini():
         logging.exception("Ошибка при обработке запроса")
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
     
-# ✅ **Гороскоп на сегодня**
-@app.route('/horoscope/today', methods=['POST'])
-def horoscope_today():
+@app.route('/tarot/gemini', methods=['POST'])
+def tarot_gemini():
     try:
-        logging.info("Получен запрос на гороскоп на сегодня")
-
+        logging.info("Получен запрос на эндпоинт /tarot/gemini")
         data = request.get_json()
-        zodiac_sign = data.get('zodiac_sign')
-
-        if not zodiac_sign:
-            logging.error("Некорректный запрос: отсутствует знак зодиака")
-            return jsonify({'error': 'Укажите знак зодиака'}), 400
-
-        # Запрос в Gemini
-        query = f"Предоставь детальный гороскоп на сегодня для знака зодиака {zodiac_sign}. Ответ должен быть кратким и содержательным."
+        logging.debug(f"Данные запроса: {data}")
+        query = data.get('query')
+        if not query:
+            logging.error("Запрос не содержит параметра 'query'")
+            return jsonify({'error': 'No query provided'}), 400
 
         logging.info(f"Отправляем запрос в Gemini: {query}")
         response = gemini_client.models.generate_content(
@@ -86,23 +82,21 @@ def horoscope_today():
             contents=query
         )
 
-        # Проверяем ответ
         if hasattr(response, 'text') and response.text:
             result = response.text.strip()
             logging.info(f"Ответ от Gemini: {result}")
-
-            # Переводим ответ на русский
-            translated_result = translator.translate(result, src='en', dest='ru').text
+            translated_result = translator.translate(result, "ru")
             logging.info(f"Переведенный ответ: {translated_result}")
-
-            return jsonify({'answer': translated_result})
+            return jsonify({'answer': str(translated_result.result)})
         else:
             logging.error("Gemini вернул пустой ответ")
-            return jsonify({'error': 'Gemini не дал ответа'}), 500
+            return jsonify({'error': 'Empty response from Gemini'}), 500
 
     except Exception as e:
         logging.exception("Ошибка при обработке запроса")
-        return jsonify({'error': f'Ошибка сервера: {str(e)}'}), 500
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+    
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8000)
