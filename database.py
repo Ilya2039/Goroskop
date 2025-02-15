@@ -11,7 +11,7 @@ def get_connection():
         port=POSTGRES_PORT
     )
 
-def init_db():
+def init_db(): 
     """
     Инициализация базы данных PostgreSQL (синхронно, вызывается один раз при старте).
     Создает таблицу users, если её нет.
